@@ -64,33 +64,36 @@ class RmanDenoiser:
         passSpecular = passes.get("variance").get("specular", None)
         passSpecularVariance = passes.get("variance").get("specular_variance", None)
 
-        features = {}    
-        features['albedo'] = passAlbedo
-        features['albedoVariance'] = passAlbedoVariance
-        features['normal'] = passNormal
-        features['normalVariance'] = passNormalVariance
-        features['sampleCount'] = passSampleCount           
-      
-        if "asym" in self.topology:
-            asymmetry = np.broadcast_to(self.asymmetry, shape=features["data"].shape[:-1] + (1,))
-            features["asymmetry"] = asymmetry
 
-        if "full" in self.topology and not "gen2" in self.topology:
-            divideAlbedo = np.broadcast_to(0.0, shape=features["data"].shape[:-1] + (1,))
-            features["divideAlbedo"] = divideAlbedo
-
-        # first deal with denoising the beauty
+        # Build features for beauty pass
+        features = {
+            'albedo': passAlbedo,
+            'albedoVariance': passAlbedoVariance,
+            'normal': passNormal,
+            'normalVariance': passNormalVariance,
+            'sampleCount': passSampleCount
+        }
         if self.use_color_pass:
             features["data"] = passInput
             features["dataVariance"] = passInputVariance
+            if "asym" in self.topology and features["data"] is not None:
+                asymmetry = np.broadcast_to(self.asymmetry, shape=features["data"].shape[:-1] + (1,))
+                features["asymmetry"] = asymmetry
+            if "full" in self.topology and "gen2" not in self.topology and features["data"] is not None:
+                divideAlbedo = np.broadcast_to(0.0, shape=features["data"].shape[:-1] + (1,))
+                features["divideAlbedo"] = divideAlbedo
             self.denoiser.setFeatures(features, 0)
             self.denoiser.computeWeights()
             denoisedBeauty = self.denoiser.applyWeights([passInput])
         else:
-            # denoise diffuse & specular
-            # and then add together to get beauty
             features["data"] = passDiffuse
             features["dataVariance"] = passDiffuseVariance
+            if "asym" in self.topology and features["data"] is not None:
+                asymmetry = np.broadcast_to(self.asymmetry, shape=features["data"].shape[:-1] + (1,))
+                features["asymmetry"] = asymmetry
+            if "full" in self.topology and "gen2" not in self.topology and features["data"] is not None:
+                divideAlbedo = np.broadcast_to(0.0, shape=features["data"].shape[:-1] + (1,))
+                features["divideAlbedo"] = divideAlbedo
             self.denoiser.setFeatures(features, 0)
             self.denoiser.computeWeights()
             denoisedDiffuse = self.denoiser.applyWeights([passDiffuse])
@@ -103,9 +106,17 @@ class RmanDenoiser:
 
             denoisedBeauty = denoisedDiffuse + denoisedSpecular
 
-        features["data"] = passAlpha
-        features["dataVariance"] = passAlphaVariance
-        self.denoiser.setFeatures(features, 0)
+        # Alpha pass (new features dict)
+        features_alpha = {
+            'albedo': passAlbedo,
+            'albedoVariance': passAlbedoVariance,
+            'normal': passNormal,
+            'normalVariance': passNormalVariance,
+            'sampleCount': passSampleCount,
+            'data': passAlpha,
+            'dataVariance': passAlphaVariance
+        }
+        self.denoiser.setFeatures(features_alpha, 0)
         self.denoiser.computeWeights()
         denoisedAlpha = self.denoiser.applyWeights([passAlpha])
         
@@ -138,34 +149,46 @@ class RmanDenoiser:
             p = passes[dspy_nm]
             self.stats_mgr.draw_message("Denoising (%s)" % dspy_nm)
             denoise_pass = None
+            # Build features dict for this pass
+            current_features = {
+                'albedo': passAlbedo,
+                'albedoVariance': passAlbedoVariance,
+                'normal': passNormal,
+                'normalVariance': passNormalVariance,
+                'sampleCount': passSampleCount
+            }
             if p["num_channels"] == 3:
                 if p["pass_type"] == "color":
-                    features["data"] = passInput
-                    features["dataVariance"] = passInputVariance
+                    current_features["data"] = passInput
+                    current_features["dataVariance"] = passInputVariance
                 else:
-                    features["data"] = passAlpha
-                    features["dataVariance"] = passAlphaVariance
-                self.denoiser.setFeatures(features, 0)
+                    current_features["data"] = passAlpha
+                    current_features["dataVariance"] = passAlphaVariance
+                if "asym" in self.topology and current_features["data"] is not None:
+                    asymmetry = np.broadcast_to(self.asymmetry, shape=current_features["data"].shape[:-1] + (1,))
+                    current_features["asymmetry"] = asymmetry
+                self.denoiser.setFeatures(current_features, 0)
                 self.denoiser.computeWeights()
                 denoise_pass = self.denoiser.applyWeights([p['input']])
                 if use_border:
-                    denoise_pass = denoise_pass[start_y:end_y,start_x:end_x,:]
+                    denoise_pass = denoise_pass[start_y:end_y, start_x:end_x, :]
                 denoise_pass = denoise_pass.reshape((end_y-start_y)*(end_x-start_x), 3)
             elif p["num_channels"] == 1:
-                features["data"] = passAlpha
-                features["dataVariance"] = passAlphaVariance
-                self.denoiser.setFeatures(features, 0)
+                current_features["data"] = passAlpha
+                current_features["dataVariance"] = passAlphaVariance
+                if "asym" in self.topology and current_features["data"] is not None:
+                    asymmetry = np.broadcast_to(self.asymmetry, shape=current_features["data"].shape[:-1] + (1,))
+                    current_features["asymmetry"] = asymmetry
+                self.denoiser.setFeatures(current_features, 0)
                 self.denoiser.computeWeights()
                 denoise_pass = self.denoiser.applyWeights([p['input']])  
                 if use_border:
-                    denoise_pass = denoise_pass[start_y:end_y,start_x:end_x,:]  
+                    denoise_pass = denoise_pass[start_y:end_y, start_x:end_x, :]  
                 denoise_pass = denoise_pass.reshape((end_y-start_y)*(end_x-start_x), 3)
-                denoise_pass = denoise_pass[:,:1]  
+                denoise_pass = denoise_pass[:, :1]  
             denoised_passes[dspy_nm] = denoise_pass   
-            finished += 1
-            self.stats_mgr._progress = int(100*finished/total)    
+            self.stats_mgr._progress = int(100 * (i + 1) / total)
 
-        finished += 1
-        self.stats_mgr._progress = int(100)               
-
+        # Set progress to 100% at the end
+        self.stats_mgr._progress = 100
         return denoised_passes
