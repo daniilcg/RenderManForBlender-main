@@ -1,29 +1,35 @@
 import os
-from .rfb_utils.envconfig_utils import envconfig
-from .rfb_utils import scene_utils
-from collections import OrderedDict
 import numpy as np
+from collections import OrderedDict
+
+from rfb_utils.envconfig_utils import envconfig
+from rfb_utils import scene_utils
 
 
 class RmanDenoiser:
 
     def __init__(self, stats_mgr):
+
         self.stats_mgr = stats_mgr
+        self.denoiser = None
+
         self.width = -1
         self.height = -1
         self.asymmetry = 0.0
         self.use_color_pass = False
 
-        self.denoiser = None
-        self.parameters = None
         self.topology = None
+
+        # reusable buffers
+        self.features = {}
+        self.asymmetry_buffer = None
+        self.divide_buffer = None
 
     def bootstrap(self, width, height, asymmetry, use_color_pass):
 
         try:
             import QuicklyNoiseless as qn
         except ImportError:
-            self.denoiser = None
             return
 
         self.width = width
@@ -31,196 +37,180 @@ class RmanDenoiser:
         self.asymmetry = asymmetry
         self.use_color_pass = use_color_pass
 
-        if asymmetry > 0.0:
-            self.parameters = os.path.join(
-                envconfig().rmantree, "lib", "denoise", "14433-renderman.param")
-            self.topology = os.path.join(
-                envconfig().rmantree, "lib", "denoise", "full_w1_5s_asym.topo")
-        else:
-            self.parameters = os.path.join(
-                envconfig().rmantree, "lib", "denoise", "20973-renderman.param")
-            self.topology = os.path.join(
-                envconfig().rmantree, "lib", "denoise", "full_w1_5s_sym_gen2.topo")
+        rman = envconfig().rmantree
 
-        self.denoiser = qn.Denoiser(height, width, self.parameters, self.topology)
+        if asymmetry > 0:
+            param = os.path.join(rman, "lib", "denoise", "14433-renderman.param")
+            topo = os.path.join(rman, "lib", "denoise", "full_w1_5s_asym.topo")
+        else:
+            param = os.path.join(rman, "lib", "denoise", "20973-renderman.param")
+            topo = os.path.join(rman, "lib", "denoise", "full_w1_5s_sym_gen2.topo")
+
+        self.topology = topo
+
+        self.denoiser = qn.Denoiser(height, width, param, topo)
         self.denoiser.enableWarping(-1.0, 1.0, False)
 
-    def _run_denoise(self, features, data):
+        # preallocated buffers
+        self.asymmetry_buffer = np.full(
+            (height, width, 1),
+            asymmetry,
+            dtype=np.float32
+        )
+
+        self.divide_buffer = np.zeros(
+            (height, width, 1),
+            dtype=np.float32
+        )
+
+    def _prepare_features(self, base, data, variance):
+
+        f = self.features
+        f.clear()
+
+        f["albedo"] = base["albedo"]
+        f["albedoVariance"] = base["albedoVariance"]
+        f["normal"] = base["normal"]
+        f["normalVariance"] = base["normalVariance"]
+        f["sampleCount"] = base["sampleCount"]
+
+        f["data"] = data
+        f["dataVariance"] = variance
+
+        if "asym" in self.topology and data is not None:
+            f["asymmetry"] = self.asymmetry_buffer
+
+        if "full" in self.topology and "gen2" not in self.topology:
+            f["divideAlbedo"] = self.divide_buffer
+
+        return f
+
+    def _compute_weights(self, features):
+
         self.denoiser.setFeatures(features, 0)
         self.denoiser.computeWeights()
+
+    def _apply(self, data):
+
         return self.denoiser.applyWeights([data])
 
     def denoise(self, passes, render, render_border):
 
-        if self.denoiser is None:
+        if not self.denoiser:
             return None
 
-        total = len(passes)
-        finished = 0
-
-        self.stats_mgr._progress = 0
-        self.stats_mgr.draw_message("Denoising (beauty)")
-
-        denoised_passes = OrderedDict()
-
-        # --- variance channels safely ---
         variance = passes.get("variance", {})
 
         passInput = variance.get("input")
-        passNormal = variance.get("normal")
-        passNormalVariance = variance.get("normal_variance")
-        passInputVariance = variance.get("input_variance")
-        passAlbedo = variance.get("albedo")
-        passAlbedoVariance = variance.get("albedo_variance")
-        passSampleCount = variance.get("sample_count")
-        passAlpha = variance.get("alpha")
-        passAlphaVariance = variance.get("alpha_variance")
-        passDiffuse = variance.get("diffuse")
-        passDiffuseVariance = variance.get("diffuse_variance")
-        passSpecular = variance.get("specular")
-        passSpecularVariance = variance.get("specular_variance")
+        passInputVar = variance.get("input_variance")
 
-        # --- features base ---
+        passAlbedo = variance.get("albedo")
+        passAlbedoVar = variance.get("albedo_variance")
+
+        passNormal = variance.get("normal")
+        passNormalVar = variance.get("normal_variance")
+
+        passSample = variance.get("sample_count")
+
+        passDiffuse = variance.get("diffuse")
+        passDiffuseVar = variance.get("diffuse_variance")
+
+        passSpecular = variance.get("specular")
+        passSpecularVar = variance.get("specular_variance")
+
+        passAlpha = variance.get("alpha")
+        passAlphaVar = variance.get("alpha_variance")
+
         base_features = {
             "albedo": passAlbedo,
-            "albedoVariance": passAlbedoVariance,
+            "albedoVariance": passAlbedoVar,
             "normal": passNormal,
-            "normalVariance": passNormalVariance,
-            "sampleCount": passSampleCount
+            "normalVariance": passNormalVar,
+            "sampleCount": passSample
         }
 
-        # --- beauty denoise ---
-        features = dict(base_features)
+        denoised_passes = OrderedDict()
+
+        self.stats_mgr.draw_message("Denoising (beauty)")
+
+        # --- beauty pass ---
 
         if self.use_color_pass:
-            features["data"] = passInput
-            features["dataVariance"] = passInputVariance
-        else:
-            features["data"] = passDiffuse
-            features["dataVariance"] = passDiffuseVariance
 
-        if "asym" in self.topology and features["data"] is not None:
-            asymmetry = np.broadcast_to(
-                self.asymmetry,
-                shape=features["data"].shape[:-1] + (1,))
-            features["asymmetry"] = asymmetry
+            f = self._prepare_features(base_features, passInput, passInputVar)
 
-        if "full" in self.topology and "gen2" not in self.topology and features["data"] is not None:
-            divideAlbedo = np.broadcast_to(
-                0.0,
-                shape=features["data"].shape[:-1] + (1,))
-            features["divideAlbedo"] = divideAlbedo
+            self._compute_weights(f)
 
-        if self.use_color_pass:
-            denoisedBeauty = self._run_denoise(features, passInput)
+            beauty = self._apply(passInput)
 
         else:
-            denoisedDiffuse = self._run_denoise(features, passDiffuse)
 
-            features["data"] = passSpecular
-            features["dataVariance"] = passSpecularVariance
+            f = self._prepare_features(base_features, passDiffuse, passDiffuseVar)
 
-            denoisedSpecular = self._run_denoise(features, passSpecular)
+            self._compute_weights(f)
 
-            denoisedBeauty = denoisedDiffuse + denoisedSpecular
+            diffuse = self._apply(passDiffuse)
+            specular = self._apply(passSpecular)
+
+            beauty = diffuse + specular
 
         # --- alpha ---
-        features_alpha = dict(base_features)
 
-        features_alpha["data"] = passAlpha
-        features_alpha["dataVariance"] = passAlphaVariance
+        f = self._prepare_features(base_features, passAlpha, passAlphaVar)
 
-        denoisedAlpha = self._run_denoise(features_alpha, passAlpha)
+        self._compute_weights(f)
 
-        # --- crop / border ---
+        alpha = self._apply(passAlpha)
+
+        # --- borders ---
+
         use_border = render.use_border and not render.use_crop_to_border
 
         if render_border:
-            start_y, end_y, start_x, end_x = render_border
+            sy, ey, sx, ex = render_border
         else:
-            size_x, size_y, start_x, end_x, start_y, end_y = scene_utils.get_render_borders(
-                render, self.height, self.width)
+            _, _, sx, ex, sy, ey = scene_utils.get_render_borders(
+                render,
+                self.height,
+                self.width
+            )
 
         if use_border:
-            denoisedBeauty = denoisedBeauty[start_y:end_y, start_x:end_x, :]
-            denoisedAlpha = denoisedAlpha[start_y:end_y, start_x:end_x, :]
+            beauty = beauty[sy:ey, sx:ex, :]
+            alpha = alpha[sy:ey, sx:ex, :]
 
-        # --- reshape ---
-        pixels = (end_y - start_y) * (end_x - start_x)
+        pixels = (ey - sy) * (ex - sx)
 
-        denoisedBeauty = denoisedBeauty.reshape(pixels, 3)
+        beauty = beauty.reshape(pixels, 3)
+        alpha = alpha[..., 0:1].reshape(pixels, 1)
 
-        alpha = denoisedAlpha[..., 0:1]
-        alpha = alpha.reshape(pixels, 1)
-
-        combined = np.concatenate((denoisedBeauty, alpha), axis=1)
-
-        denoised_passes["beauty"] = combined
-
-        finished += 1
-        self.stats_mgr._progress = int(100 * finished / total)
-        self.stats_mgr.draw_message("Denoising (beauty)")
+        denoised_passes["beauty"] = np.concatenate((beauty, alpha), axis=1)
 
         # --- other passes ---
-        for i, dspy_nm in enumerate(passes.keys()):
 
-            if i == 0:
+        for name, p in passes.items():
+
+            if name == "variance":
                 continue
-
-            p = passes[dspy_nm]
-
-            self.stats_mgr.draw_message(f"Denoising ({dspy_nm})")
-
-            current_features = dict(base_features)
 
             if p["num_channels"] == 3:
 
-                if p["pass_type"] == "color":
-                    current_features["data"] = passInput
-                    current_features["dataVariance"] = passInputVariance
-                else:
-                    current_features["data"] = passAlpha
-                    current_features["dataVariance"] = passAlphaVariance
+                f = self._prepare_features(base_features, passInput, passInputVar)
 
-                if "asym" in self.topology and current_features["data"] is not None:
-                    asymmetry = np.broadcast_to(
-                        self.asymmetry,
-                        shape=current_features["data"].shape[:-1] + (1,))
-                    current_features["asymmetry"] = asymmetry
+            else:
 
-                denoise_pass = self._run_denoise(
-                    current_features,
-                    p["input"])
+                f = self._prepare_features(base_features, passAlpha, passAlphaVar)
 
-                if use_border:
-                    denoise_pass = denoise_pass[start_y:end_y, start_x:end_x, :]
+            self._compute_weights(f)
 
-                denoise_pass = denoise_pass.reshape(pixels, 3)
+            result = self._apply(p["input"])
 
-            elif p["num_channels"] == 1:
+            if use_border:
+                result = result[sy:ey, sx:ex, :]
 
-                current_features["data"] = passAlpha
-                current_features["dataVariance"] = passAlphaVariance
+            result = result.reshape(pixels, p["num_channels"])
 
-                if "asym" in self.topology and current_features["data"] is not None:
-                    asymmetry = np.broadcast_to(
-                        self.asymmetry,
-                        shape=current_features["data"].shape[:-1] + (1,))
-                    current_features["asymmetry"] = asymmetry
-
-                denoise_pass = self._run_denoise(
-                    current_features,
-                    p["input"])
-
-                if use_border:
-                    denoise_pass = denoise_pass[start_y:end_y, start_x:end_x, :]
-
-                denoise_pass = denoise_pass.reshape(pixels, 3)
-                denoise_pass = denoise_pass[:, :1]
-
-            denoised_passes[dspy_nm] = denoise_pass
-
-            self.stats_mgr._progress = int(100 * (i + 1) / total)
+            denoised_passes[name] = result
 
         self.stats_mgr._progress = 100
 
