@@ -7,6 +7,15 @@ from rfb_utils import scene_utils
 
 
 class RmanDenoiser:
+    """
+    Optimized wrapper around RenderMan QuicklyNoiseless denoiser.
+
+    Provides:
+    - robust feature sanitization
+    - feature reuse
+    - faster weight computation
+    - safer handling of render passes
+    """
 
     def __init__(self, stats_mgr):
 
@@ -20,10 +29,14 @@ class RmanDenoiser:
 
         self.topology = None
 
-        # reusable buffers
+        # reusable structures
         self.features = {}
         self.asymmetry_buffer = None
         self.divide_buffer = None
+
+    # -------------------------------------------------------------
+    # Initialization
+    # -------------------------------------------------------------
 
     def bootstrap(self, width, height, asymmetry, use_color_pass):
 
@@ -52,18 +65,32 @@ class RmanDenoiser:
         self.denoiser.enableWarping(-1.0, 1.0, False)
 
         # preallocated buffers
-        self.asymmetry_buffer = np.full(
-            (height, width, 1),
-            asymmetry,
-            dtype=np.float32
-        )
+        self.asymmetry_buffer = np.full((height, width, 1), asymmetry, dtype=np.float32)
+        self.divide_buffer = np.zeros((height, width, 1), dtype=np.float32)
 
-        self.divide_buffer = np.zeros(
-            (height, width, 1),
-            dtype=np.float32
-        )
+    # -------------------------------------------------------------
+    # Utility functions
+    # -------------------------------------------------------------
+
+    def _sanitize(self, arr):
+        """Remove NaN / Inf values to prevent denoiser artifacts."""
+        if arr is None:
+            return None
+        if not np.isfinite(arr).all():
+            arr = np.nan_to_num(arr)
+        return arr
+
+    def _normalize_normals(self, normals):
+        """Ensure normals are unit length."""
+        if normals is None:
+            return None
+
+        length = np.linalg.norm(normals, axis=2, keepdims=True)
+        length[length == 0] = 1.0
+        return normals / length
 
     def _prepare_features(self, base, data, variance):
+        """Populate reusable feature dictionary."""
 
         f = self.features
         f.clear()
@@ -86,13 +113,15 @@ class RmanDenoiser:
         return f
 
     def _compute_weights(self, features):
-
         self.denoiser.setFeatures(features, 0)
         self.denoiser.computeWeights()
 
     def _apply(self, data):
-
         return self.denoiser.applyWeights([data])
+
+    # -------------------------------------------------------------
+    # Main denoise pipeline
+    # -------------------------------------------------------------
 
     def denoise(self, passes, render, render_border):
 
@@ -101,24 +130,26 @@ class RmanDenoiser:
 
         variance = passes.get("variance", {})
 
-        passInput = variance.get("input")
+        passInput = self._sanitize(variance.get("input"))
         passInputVar = variance.get("input_variance")
 
-        passAlbedo = variance.get("albedo")
+        passAlbedo = self._sanitize(variance.get("albedo"))
         passAlbedoVar = variance.get("albedo_variance")
 
-        passNormal = variance.get("normal")
+        passNormal = self._normalize_normals(
+            self._sanitize(variance.get("normal"))
+        )
         passNormalVar = variance.get("normal_variance")
 
         passSample = variance.get("sample_count")
 
-        passDiffuse = variance.get("diffuse")
+        passDiffuse = self._sanitize(variance.get("diffuse"))
         passDiffuseVar = variance.get("diffuse_variance")
 
-        passSpecular = variance.get("specular")
+        passSpecular = self._sanitize(variance.get("specular"))
         passSpecularVar = variance.get("specular_variance")
 
-        passAlpha = variance.get("alpha")
+        passAlpha = self._sanitize(variance.get("alpha"))
         passAlphaVar = variance.get("alpha_variance")
 
         base_features = {
@@ -133,14 +164,15 @@ class RmanDenoiser:
 
         self.stats_mgr.draw_message("Denoising (beauty)")
 
-        # --- beauty pass ---
+        # -------------------------------------------------
+        # Beauty pass
+        # -------------------------------------------------
 
         if self.use_color_pass:
 
             f = self._prepare_features(base_features, passInput, passInputVar)
 
             self._compute_weights(f)
-
             beauty = self._apply(passInput)
 
         else:
@@ -154,15 +186,18 @@ class RmanDenoiser:
 
             beauty = diffuse + specular
 
-        # --- alpha ---
+        # -------------------------------------------------
+        # Alpha pass
+        # -------------------------------------------------
 
         f = self._prepare_features(base_features, passAlpha, passAlphaVar)
 
         self._compute_weights(f)
-
         alpha = self._apply(passAlpha)
 
-        # --- borders ---
+        # -------------------------------------------------
+        # Border / crop handling
+        # -------------------------------------------------
 
         use_border = render.use_border and not render.use_crop_to_border
 
@@ -184,9 +219,16 @@ class RmanDenoiser:
         beauty = beauty.reshape(pixels, 3)
         alpha = alpha[..., 0:1].reshape(pixels, 1)
 
-        denoised_passes["beauty"] = np.concatenate((beauty, alpha), axis=1)
+        result = np.concatenate((beauty, alpha), axis=1)
 
-        # --- other passes ---
+        # clamp result
+        result = np.clip(result, 0.0, 1.0)
+
+        denoised_passes["beauty"] = result
+
+        # -------------------------------------------------
+        # Additional passes
+        # -------------------------------------------------
 
         for name, p in passes.items():
 
@@ -194,11 +236,8 @@ class RmanDenoiser:
                 continue
 
             if p["num_channels"] == 3:
-
                 f = self._prepare_features(base_features, passInput, passInputVar)
-
             else:
-
                 f = self._prepare_features(base_features, passAlpha, passAlphaVar)
 
             self._compute_weights(f)
